@@ -1,7 +1,9 @@
+// Interfaces
 mod domain;
 mod function;
 mod value;
 
+// Domains
 mod booleans;
 mod interval;
 

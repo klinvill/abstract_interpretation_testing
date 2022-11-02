@@ -1,6 +1,7 @@
 extern crate rustc_error_codes;
 extern crate rustc_errors;
 extern crate rustc_hash;
+extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_session;
@@ -9,9 +10,12 @@ extern crate rustc_smir as smir;
 use crate::domains::{AbstractFunction, AbstractValue};
 use crate::errors::*;
 use crate::mir_helpers::get_fn_types;
+use log::debug;
 use rustc_errors::registry;
 use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::def_id::DefId;
 use rustc_session::config::{self, CheckCfg};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::{process, str};
 
@@ -25,7 +29,7 @@ fn get_sysroot() -> String {
     sysroot
 }
 
-pub fn analyze_program(program: PathBuf) -> bool {
+pub fn analyze_program(program: PathBuf) -> HashMap<DefId, AbstractFunction> {
     let sysroot = get_sysroot();
     let config = rustc_interface::Config {
         // Command line options
@@ -42,7 +46,6 @@ pub fn analyze_program(program: PathBuf) -> bool {
         output_dir: None,
         output_file: None,
         file_loader: None,
-        diagnostic_output: rustc_session::DiagnosticOutput::Default,
         lint_caps: FxHashMap::default(),
         parse_sess_created: None,
         register_lints: None,
@@ -55,22 +58,32 @@ pub fn analyze_program(program: PathBuf) -> bool {
     // We need to run the compiler ourselves in order to get the MIR representation of a program.
     // Example of running the compiler through rustc_interface up here:
     //  https://github.com/rust-lang/rustc-dev-guide/blob/master/examples/rustc-driver-example.rs
-    rustc_interface::run_compiler(config, |compiler| {
+    let results = rustc_interface::run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().unwrap().take().enter(|tcx| {
+                let mut abstract_fns = HashMap::new();
                 // Get the optimized mir
                 let keys = tcx.mir_keys(());
-                println!("All found keys in MIR: {keys:?}");
+                debug!("All found keys in MIR: {keys:?}");
                 for key in keys.iter() {
-                    println!("Checking for key: {key:?}");
+                    debug!("Checking for key: {key:?}");
                     let mir = tcx.optimized_mir(*key);
-                    analyze_function(mir);
+                    let abstract_result = analyze_function(mir);
+                    match abstract_result {
+                        Ok(abstract_fn) => {
+                            abstract_fns.insert(key.to_def_id(), abstract_fn);
+                            ()
+                        },
+                        _ => (),
+                    };
                 }
-            });
-        });
+
+                abstract_fns
+            })
+        })
     });
 
-    true
+    results
 }
 
 // TODO(klinvill): Should replace ty type with &smir::ty::Ty, but it looks like the latest
@@ -94,22 +107,23 @@ fn can_interpret(local_decls: &[&smir::mir::LocalDecl]) -> bool {
     })
 }
 
-fn analyze_function(function: &smir::mir::Body) -> bool {
-    println!("{function:?}");
+fn analyze_function(function: &smir::mir::Body) -> Result<AbstractFunction, Error> {
+    debug!("{function:?}");
 
     let (arg_types, return_type) = get_fn_types(function);
 
-    println!("Argument types: {arg_types:?}");
-    println!("Return type: {return_type:?}");
+    debug!("Argument types: {arg_types:?}");
+    debug!("Return type: {return_type:?}");
 
     let local_decls: Vec<&smir::mir::LocalDecl> = function.local_decls.iter().collect();
     if can_interpret(&local_decls) {
         let function = interpret_intervals(function);
-        println!("Abstract function: {function:?}");
+        debug!("Abstract function: {function:?}\n");
+        function
+    } else {
+        debug!("\n");
+        Err(Error::new(ErrorKind::InterpreterError))
     }
-
-    println!();
-    true
 }
 
 fn interpret_intervals(function: &smir::mir::Body) -> Result<AbstractFunction, Error> {

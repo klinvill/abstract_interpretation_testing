@@ -1,6 +1,7 @@
 #[derive(Debug)]
 pub enum ErrorKind {
     NotImplementedError,
+    InterpreterError,
 }
 
 // TODO(klinvill): consider using the thiserror crate instead.
