@@ -2,6 +2,7 @@
 pub enum ErrorKind {
     NotImplementedError,
     InterpreterError,
+    InvalidArgumentError,
 }
 
 // TODO(klinvill): consider using the thiserror crate instead.

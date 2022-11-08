@@ -6,7 +6,7 @@ use crate::domains::booleans;
 use crate::domains::domain::AbstractDomain;
 use crate::domains::interval;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AbstractValue {
     Bool(booleans::AbstractBool),
     // TODO(klinvill): A function that returns different kinds of AbstractValue types based on the
@@ -18,6 +18,8 @@ pub enum AbstractValue {
     IntInterval(interval::Interval<i128>),
     UintInterval(interval::Interval<u128>),
     Tuple(Vec<AbstractValue>),
+    // Value that represents an unitialized value.Can be explicitly created through a statement like Deinit.
+    Uninit,
 }
 
 impl AbstractDomain for AbstractValue {
@@ -49,6 +51,7 @@ impl AbstractDomain for AbstractValue {
             AbstractValue::Tuple(avs) => {
                 AbstractValue::Tuple(avs.iter().map(|x| x.top()).collect())
             }
+            AbstractValue::Uninit => AbstractValue::Uninit,
         }
     }
 }
@@ -75,6 +78,40 @@ impl AbstractValue {
                 try_avs.map(AbstractValue::Tuple)
             }
             _ => Err(Error::new(ErrorKind::NotImplementedError)),
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Self> {
+        match self {
+            AbstractValue::Tuple(entries) => entries.get(index),
+            _ => None,
+        }
+    }
+
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Self> {
+        match self {
+            AbstractValue::Tuple(entries) => entries.get_mut(index),
+            _ => None,
+        }
+    }
+
+    pub fn set(&mut self, index: usize, value: AbstractValue) -> Result<(), Error> {
+        match self {
+            AbstractValue::Tuple(entries) => {
+                if index < entries.len() {
+                    entries[index] = value;
+                    Ok(())
+                } else {
+                    Err(Error::with_message(
+                        ErrorKind::InterpreterError,
+                        "Tried to index entry outside tuple limits".to_string()
+                    ))
+                }
+            },
+            _ => Err(Error::with_message(
+                ErrorKind::NotImplementedError,
+                format!("set not implemented for abstract value: {:?}", value).to_string()
+            )),
         }
     }
 }

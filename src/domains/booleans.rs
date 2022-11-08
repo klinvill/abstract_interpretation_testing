@@ -81,3 +81,20 @@ impl From<bool> for AbstractBool {
         }
     }
 }
+
+impl AbstractBool {
+    /// Abstract boolean equality operation
+    pub(crate) fn equals(&self, other: &Self) -> AbstractBool {
+        match (self, other) {
+            (AbstractBool::Top, _) | (_, AbstractBool::Top) => AbstractBool::Top,
+            (AbstractBool::Bot, _) | (_, AbstractBool::Bot) => AbstractBool::Bot,
+            (a, b) => {
+                if a == b {
+                    AbstractBool::True
+                } else {
+                    AbstractBool::False
+                }
+            }
+        }
+    }
+}

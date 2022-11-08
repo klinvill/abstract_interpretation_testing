@@ -7,7 +7,7 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_smir as smir;
 
-use crate::domains::{AbstractFunction, AbstractValue};
+use crate::domains::{AbstractFunction, AbstractValue, booleans, interval};
 use crate::errors::*;
 use crate::mir_helpers::get_fn_types;
 use log::debug;
@@ -18,6 +18,8 @@ use rustc_session::config::{self, CheckCfg};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::{process, str};
+use crate::domains::AbstractValue::IntInterval;
+use crate::domains::interval::Interval;
 
 fn get_sysroot() -> String {
     let out = process::Command::new("rustc")
@@ -108,7 +110,7 @@ fn can_interpret(local_decls: &[&smir::mir::LocalDecl]) -> bool {
 }
 
 fn analyze_function(function: &smir::mir::Body) -> Result<AbstractFunction, Error> {
-    debug!("{function:?}");
+    debug!("{function:#?}");
 
     let (arg_types, return_type) = get_fn_types(function);
 
@@ -117,9 +119,11 @@ fn analyze_function(function: &smir::mir::Body) -> Result<AbstractFunction, Erro
 
     let local_decls: Vec<&smir::mir::LocalDecl> = function.local_decls.iter().collect();
     if can_interpret(&local_decls) {
-        let function = interpret_intervals(function);
-        debug!("Abstract function: {function:?}\n");
-        function
+        let abstract_fn = interpret_intervals(function);
+        debug!("Abstract function: {abstract_fn:?}\n");
+        let state = interpret_body(function, &vec![IntInterval(Interval::from(3))]);
+        debug!("State: {state:?}\n");
+        abstract_fn
     } else {
         debug!("\n");
         Err(Error::new(ErrorKind::InterpreterError))
@@ -140,5 +144,198 @@ fn interpret_intervals(function: &smir::mir::Body) -> Result<AbstractFunction, E
         }),
         (Err(e), _) => Err(e),
         (_, Err(e)) => Err(e),
+    }
+}
+
+fn interpret_body(body: &smir::mir::Body, arg_values: &Vec<AbstractValue>) -> Result<HashMap<smir::mir::Local, AbstractValue>, Error> {
+    let mut state = HashMap::new();
+    let mut errors = Vec::new();
+
+    let (arg_types, return_type) = get_fn_types(body);
+    if arg_values.len() != arg_types.len() {
+        return Err(Error::with_message(
+            ErrorKind::InvalidArgumentError,
+            "Must supply same number of arguments as the function takes as input when interpretting it.".to_string()
+        ))
+    }
+
+    // Insert arguments into state map
+    for (i, arg) in arg_values.iter().enumerate() {
+        state.insert(smir::mir::Local::from_usize(i+1), arg.clone());
+    }
+
+    for (bb, block) in body.basic_blocks.iter_enumerated() {
+        let result = interpret_block(block, &mut state);
+        match result {
+            Err(e) => errors.push(e),
+            _ => (),
+        }
+    }
+    debug!("Errors while interpreting body: {errors:#?}");
+    Ok(state)
+}
+
+fn interpret_block(block: &smir::mir::BasicBlockData, state: &mut HashMap<smir::mir::Local, AbstractValue>) -> Result<(), Error> {
+    for statement in &block.statements {
+        interpret_statement(statement, state)?;
+    }
+    Ok(())
+}
+
+fn interpret_statement(statement: &smir::mir::Statement, state: &mut HashMap<smir::mir::Local, AbstractValue>) -> Result<(), Error> {
+    match &statement.kind {
+        smir::mir::StatementKind::Assign(box (place, rvalue)) => {
+            let loc = place.local_or_deref_local().ok_or(Error::new(ErrorKind::InterpreterError))?;
+            let val = interpret_rvalue(&rvalue, state)?;
+            state.insert(loc, val);
+            Ok(())
+        },
+        smir::mir::StatementKind::Deinit(box place) => {
+            let loc = place.local_or_deref_local().ok_or(Error::new(ErrorKind::InterpreterError))?;
+            state.insert(loc, AbstractValue::Uninit);
+            Ok(())
+        },
+        _ => Err(Error::new(ErrorKind::NotImplementedError)),
+    }
+}
+
+fn interpret_rvalue(rvalue: &smir::mir::Rvalue, state: &mut HashMap<smir::mir::Local, AbstractValue>) -> Result<AbstractValue, Error> {
+    match rvalue {
+        smir::mir::Rvalue::Use(op) => interpret_operand(op, state),
+        // TODO(klinvill): currently we assume checked operations never fail
+        smir::mir::Rvalue::BinaryOp(op, box (left, right)) => interpret_binop(op, left, right, state),
+        smir::mir::Rvalue::CheckedBinaryOp(op, box (left, right)) => {
+            let v = interpret_binop(op, left, right, state)?;
+            // Checked operations return the value and a boolean flag that checks if an operation succeeded
+            Ok(AbstractValue::Tuple(vec![v, AbstractValue::Bool(booleans::AbstractBool::False)]))
+        },
+        _ => Err(Error::new(ErrorKind::NotImplementedError)),
+    }
+}
+
+fn interpret_binop(binop: &smir::mir::BinOp, left: &smir::mir::Operand, right: &smir::mir::Operand, state: &mut HashMap<smir::mir::Local, AbstractValue>) -> Result<AbstractValue, Error> {
+    let left_val = interpret_operand(left, state)?;
+    let right_val = interpret_operand(right, state)?;
+    match binop {
+        smir::mir::BinOp::Add => {
+            match (left_val, right_val) {
+                (AbstractValue::IntInterval(l), AbstractValue::IntInterval(r)) => Ok(AbstractValue::IntInterval(l + r)),
+                (AbstractValue::UintInterval(l), AbstractValue::UintInterval(r)) => Ok(AbstractValue::UintInterval(l + r)),
+                _ => Err(Error::new(ErrorKind::NotImplementedError)),
+            }
+        },
+        smir::mir::BinOp::Eq => {
+            match (left_val, right_val) {
+                (AbstractValue::Bool(l), AbstractValue::Bool(r)) => Ok(AbstractValue::Bool(l.equals(&r))),
+                (AbstractValue::IntInterval(l), AbstractValue::IntInterval(r)) => Ok(AbstractValue::Bool(l.equals(&r))),
+                (AbstractValue::UintInterval(l), AbstractValue::UintInterval(r)) => Ok(AbstractValue::Bool(l.equals(&r))),
+                _ => Err(Error::new(ErrorKind::NotImplementedError)),
+            }
+        }
+        smir::mir::BinOp::Lt => {
+            match (left_val, right_val) {
+                (AbstractValue::IntInterval(l), AbstractValue::IntInterval(r)) => Ok(AbstractValue::Bool(l.less_than(&r))),
+                (AbstractValue::UintInterval(l), AbstractValue::UintInterval(r)) => Ok(AbstractValue::Bool(l.less_than(&r))),
+                _ => Err(Error::new(ErrorKind::NotImplementedError)),
+            }
+        }
+        _ => Err(Error::new(ErrorKind::NotImplementedError)),
+    }
+}
+
+fn interpret_operand(op: &smir::mir::Operand, state: &mut HashMap<smir::mir::Local, AbstractValue>) -> Result<AbstractValue, Error> {
+    match op {
+        smir::mir::Operand::Copy(place) | smir::mir::Operand::Move(place) => {
+            let value = get_place_value(&place, &state)?
+                .ok_or(Error::new(ErrorKind::InterpreterError))?;
+            // TODO(klinvill): Clone could be expensive. Should we instead wrap the abstract value
+            //  in a shared reference like Rc?
+            Ok(value.clone())
+        },
+        smir::mir::Operand::Constant(c) => match c.literal {
+            smir::mir::ConstantKind::Val(v, ty) => match v {
+                rustc_middle::mir::interpret::ConstValue::Scalar(s) => match s {
+                    rustc_middle::mir::interpret::Scalar::Int(i) => {
+                        let bits = i.to_bits(i.size()).unwrap();
+                        match ty.kind() {
+                            rustc_middle::ty::TyKind::Bool => {
+                                if bits == 0 {
+                                    Ok(AbstractValue::Bool(booleans::AbstractBool::False))
+                                } else {
+                                    Ok(AbstractValue::Bool(booleans::AbstractBool::True))
+                                }
+                            }
+                            rustc_middle::ty::TyKind::Int(_) => {
+                                let num = match i.size().bytes_usize() {
+                                    1 => i128::from(bits as i8),
+                                    2 => i128::from(bits as i16),
+                                    4 => i128::from(bits as i32),
+                                    8 => i128::from(bits as i64),
+                                    16 => i128::from(bits as i128),
+                                    _ => Err(Error::new(ErrorKind::NotImplementedError))?,
+                                };
+                                Ok(AbstractValue::IntInterval(
+                                    interval::Interval::from(num)
+                                ))
+                            },
+                            rustc_middle::ty::TyKind::Uint(_) => {
+                                let num = match i.size().bytes_usize() {
+                                    1 => u128::from(bits as u8),
+                                    2 => u128::from(bits as u16),
+                                    4 => u128::from(bits as u32),
+                                    8 => u128::from(bits as u64),
+                                    16 => u128::from(bits as u128),
+                                    _ => Err(Error::new(ErrorKind::NotImplementedError))?,
+                                };
+                                Ok(AbstractValue::UintInterval(
+                                    interval::Interval::from(num)
+                                ))
+                            },
+                            _ => Err(Error::new(ErrorKind::NotImplementedError)),
+                        }
+                    },
+                    _ => Err(Error::new(ErrorKind::NotImplementedError)),
+                },
+                _ => Err(Error::new(ErrorKind::NotImplementedError)),
+            },
+            _ => Err(Error::new(ErrorKind::NotImplementedError)),
+        }
+    }
+}
+
+
+fn get_place_value(place: &smir::mir::Place, state: &HashMap<smir::mir::Local, AbstractValue>) -> Result<Option<AbstractValue>, Error> {
+    let loc = place.local_or_deref_local();
+    match loc {
+        Some(l) => Ok(state.get(&l).cloned()),
+        None => {
+            let base = place.local;
+            let base_elem = match state.get(&base) {
+                Some(v) => v,
+                // Can't find the local in the state
+                None => return Ok(None),
+            };
+            let mut elem = base_elem;
+            for (p_ref, proj) in place.iter_projections() {
+                elem = match follow_projection(base_elem, &proj)? {
+                    Some(v) => v,
+                    // Can't follow the projection in the value
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(elem.clone()))
+        }
+    }
+}
+
+fn follow_projection<'a, V: std::fmt::Debug, T: std::fmt::Debug>(val: &'a AbstractValue, proj: &smir::mir::ProjectionElem<V,T>) -> Result<Option<&'a AbstractValue>, Error> {
+    match proj {
+        smir::mir::ProjectionElem::Field(f, ty) => {
+            Ok(val.get(f.index()))
+        },
+        _ => Err(Error::with_message(
+            ErrorKind::NotImplementedError,
+            format!("Projection handling is not implemented for projection {:?}", proj),
+        )),
     }
 }
