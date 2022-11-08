@@ -1,11 +1,11 @@
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ErrorKind {
     NotImplementedError,
     InterpreterError,
 }
 
 // TODO(klinvill): consider using the thiserror crate instead.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Error {
     kind: ErrorKind,
     message: Option<String>,
