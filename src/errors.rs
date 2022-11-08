@@ -18,4 +18,11 @@ impl Error {
             message: None,
         }
     }
+
+    pub fn with_message(kind: ErrorKind, message: String) -> Self {
+        Error {
+            kind,
+            message: Some(message),
+        }
+    }
 }
