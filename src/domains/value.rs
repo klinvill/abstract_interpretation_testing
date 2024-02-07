@@ -1,10 +1,13 @@
 extern crate rustc_middle;
+extern crate stable_mir as smir;
 
 use crate::errors::{Error, ErrorKind};
 
 use crate::domains::booleans;
 use crate::domains::domain::AbstractDomain;
 use crate::domains::interval;
+
+use smir::ty::{TyKind, RigidTy};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AbstractValue {
@@ -13,6 +16,7 @@ pub enum AbstractValue {
     //  input (e.g. the abstract_value_from_type() function) can't support AbstractValue having a
     //  generic parameter. Instead, we specialize a few intervals here to handle signed ints and
     //  unsigned ints. We use the largest primitive size for each category. Could we do this better?
+    //
     // Note: float values in rust (e.g. f64) do not implement Ord, only PartialOrd, so they can't
     //  be intervals.
     IntInterval(interval::Interval<i128>),
@@ -59,20 +63,16 @@ impl AbstractDomain for AbstractValue {
 impl AbstractValue {
     // TODO(klinvill): Should new return a result or always return a successful object? Should this
     //  be renamed to try_new()?
-    // TODO(klinvill): Should replace ty type with &smir::ty::Ty, but it looks like the latest
-    //  change including ty in smir hasn't been synced back to rust yet.
-    pub fn new(ty: &rustc_middle::ty::Ty) -> Result<Self, Error> {
+    pub fn new(ty: &smir::ty::Ty) -> Result<Self, Error> {
         match ty.kind() {
-            // TODO(klinvill): Should replace with smir::ty::TyKind types, but it looks like the
-            //  latest change including ty in smir hasn't been synced back to rust yet.
-            rustc_middle::ty::TyKind::Bool => Ok(AbstractValue::Bool(booleans::AbstractBool::Top)),
-            rustc_middle::ty::TyKind::Int(_) => Ok(AbstractValue::IntInterval(
+            TyKind::RigidTy(RigidTy::Bool) => Ok(AbstractValue::Bool(booleans::AbstractBool::Top)),
+            TyKind::RigidTy(RigidTy::Int(_)) => Ok(AbstractValue::IntInterval(
                 interval::Interval::from(0).top(),
             )),
-            rustc_middle::ty::TyKind::Uint(_) => Ok(AbstractValue::UintInterval(
+            TyKind::RigidTy(RigidTy::Uint(_)) => Ok(AbstractValue::UintInterval(
                 interval::Interval::from(0).top(),
             )),
-            rustc_middle::ty::TyKind::Tuple(tys) => {
+            TyKind::RigidTy(RigidTy::Tuple(tys)) => {
                 let try_avs: Result<Vec<AbstractValue>, _> =
                     tys.iter().map(|t| AbstractValue::new(&t)).collect();
                 try_avs.map(AbstractValue::Tuple)

@@ -1,5 +1,8 @@
+extern crate stable_mir as smir;
+
 use crate::domains::domain::AbstractDomain;
 use std::cmp::Ordering;
+use smir::ty::{TyKind, RigidTy};
 
 #[derive(Eq, PartialEq, Copy, Clone, Debug)]
 pub enum AbstractBool {
@@ -78,6 +81,25 @@ impl From<bool> for AbstractBool {
         match concrete {
             false => AbstractBool::False,
             true => AbstractBool::True,
+        }
+    }
+}
+
+impl From<&smir::ty::Const> for AbstractBool {
+    fn from(constant: &smir::ty::Const) -> Self {
+        match &constant.ty().kind()  {
+            TyKind::RigidTy(RigidTy::Bool) => (),
+            _ => panic!("Cannot construct an abstract boolean from a non-boolean constant."),
+        };
+
+        match &constant.kind() {
+            smir::ty::ConstantKind::Allocated(alloc) => match alloc.bytes[..] {
+                [Some(0)] => AbstractBool::False,
+                [Some(_)] => AbstractBool::True,
+                _ => panic!("Unexpected bytes when trying to convert from boolean constant to abstract boolean")
+            }
+
+            _ => panic!("From not implemented yet for boolean constants with a ConstantKind other than Allocated"),
         }
     }
 }

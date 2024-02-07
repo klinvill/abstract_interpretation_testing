@@ -1,3 +1,4 @@
+extern crate rustc_driver;
 extern crate rustc_error_codes;
 extern crate rustc_errors;
 extern crate rustc_hash;
@@ -5,7 +6,10 @@ extern crate rustc_hir;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_session;
-extern crate rustc_smir as smir;
+extern crate rustc_smir;
+extern crate stable_mir as smir;
+// The rustc_smir::run macro currently expects stable_mir to be in the namespace
+extern crate stable_mir;
 
 use crate::domains::{AbstractFunction, AbstractValue, booleans, interval};
 use crate::errors::*;
@@ -15,10 +19,14 @@ use rustc_errors::registry;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
 use rustc_session::config::{self, CheckCfg};
+use rustc_smir::{run, rustc_internal};
+use smir::{CrateDef};
+use smir::ty::{TyKind, RigidTy};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::{process, str};
 use crate::domains::AbstractValue::IntInterval;
+use crate::domains::booleans::AbstractBool;
 use crate::domains::interval::Interval;
 
 fn get_sysroot() -> String {
@@ -31,81 +39,73 @@ fn get_sysroot() -> String {
     sysroot
 }
 
-pub fn analyze_program(program: PathBuf) -> HashMap<DefId, AbstractFunction> {
-    let sysroot = get_sysroot();
-    let config = rustc_interface::Config {
-        // Command line options
-        opts: config::Options {
-            // It's important to include the sysroot here. Otherwise I ran into errors stating the
-            // std crate could not be found.
-            maybe_sysroot: Some(PathBuf::from(sysroot)),
-            ..config::Options::default()
-        },
-        crate_cfg: FxHashSet::default(),
-        crate_check_cfg: CheckCfg::default(),
-        input: rustc_session::config::Input::File(program),
-        input_path: None,
-        output_dir: None,
-        output_file: None,
-        file_loader: None,
-        lint_caps: FxHashMap::default(),
-        parse_sess_created: None,
-        register_lints: None,
-        override_queries: None,
-        // Registry of diagnostics codes.
-        registry: registry::Registry::new(rustc_error_codes::DIAGNOSTICS),
-        make_codegen_backend: None,
-    };
+type Summary = AbstractFunction;
 
-    // We need to run the compiler ourselves in order to get the MIR representation of a program.
-    // Example of running the compiler through rustc_interface up here:
-    //  https://github.com/rust-lang/rustc-dev-guide/blob/master/examples/rustc-driver-example.rs
-    let results = rustc_interface::run_compiler(config, |compiler| {
-        compiler.enter(|queries| {
-            queries.global_ctxt().unwrap().take().enter(|tcx| {
-                let mut abstract_fns = HashMap::new();
-                // Get the optimized mir
-                let keys = tcx.mir_keys(());
-                debug!("All found keys in MIR: {keys:?}");
-                for key in keys.iter() {
-                    debug!("Checking for key: {key:?}");
-                    let mir = tcx.optimized_mir(*key);
-                    let abstract_result = analyze_function(mir);
-                    match abstract_result {
-                        Ok(abstract_fn) => {
-                            abstract_fns.insert(key.to_def_id(), abstract_fn);
-                            ()
-                        },
-                        _ => (),
-                    };
-                }
-
-                abstract_fns
-            })
-        })
-    });
-
-    results
+fn check_summaries(summaries: HashMap<String, Summary>) {
+    // TODO(klinvill): placeholder
+    println!("Analysis results: ");
+    for (func, result) in &summaries {
+        println!("{func:?}: {result:?}");
+    }
 }
 
-// TODO(klinvill): Should replace ty type with &smir::ty::Ty, but it looks like the latest
-//  change including ty in smir hasn't been synced back to rust yet.
-fn is_tuple(ty: &rustc_middle::ty::Ty) -> bool {
-    // TODO(klinvill): Should replace with smir::ty::TyKind::Tuple(_), but it looks like the
-    //  latest change including ty in smir hasn't been synced back to rust yet.
-    matches!(ty.kind(), rustc_middle::ty::TyKind::Tuple(_))
+pub fn analyze_program<B>(_tcx: rustc_middle::ty::TyCtxt) -> std::ops::ControlFlow<B> {
+    let mut abstract_fns = HashMap::new();
+    let all_items: Vec<smir::CrateItem> = smir::all_local_items();
+    for item in all_items {
+        println!("Checking function: {}", item.name());
+        println!("Has kind: {:?}", item.kind());
+        match analyze_function(&item.body()) {
+            Ok(abstract_fn) => {
+                abstract_fns.insert(item.name(), abstract_fn);
+                ()
+            }
+            _ => (),
+        };
+    };
+
+    check_summaries(abstract_fns);
+
+    std::ops::ControlFlow::Continue(())
+}
+
+fn is_tuple(ty: &smir::ty::Ty) -> bool {
+    matches!(ty.kind(), smir::ty::TyKind::RigidTy(smir::ty::RigidTy::Tuple(_)))
+}
+
+// TODO(klinvill): Can I return a reference to the params instead of the params themselves?
+fn tuple_fields(ty: &smir::ty::Ty) -> Result<Vec<smir::ty::Ty>, Error> {
+    match ty.kind() {
+        smir::ty::TyKind::RigidTy(smir::ty::RigidTy::Tuple(params)) => Ok(params),
+        _ => Err(Error::new(ErrorKind::InvalidArgumentError)),
+    }
 }
 
 fn can_interpret(local_decls: &[&smir::mir::LocalDecl]) -> bool {
-    // TODO(klinvill): Should replace ty type with &smir::ty::Ty, but it looks like the latest
-    //  change including ty in smir hasn't been synced back to rust yet.
-    fn is_numeric_or_bool(ty: &rustc_middle::ty::Ty) -> bool {
-        ty.is_numeric() || ty.is_bool()
+    fn is_numeric(ty: &smir::ty::Ty) -> bool {
+        match ty.kind() {
+            smir::ty::TyKind::RigidTy(smir::ty::RigidTy::Int(_)) |
+            smir::ty::TyKind::RigidTy(smir::ty::RigidTy::Uint(_)) |
+            smir::ty::TyKind::RigidTy(smir::ty::RigidTy::Float(_))
+            => true,
+            _ => false,
+        }
+    }
+
+    fn is_bool(ty: &smir::ty::Ty) -> bool {
+        match ty.kind() {
+            smir::ty::TyKind::RigidTy(smir::ty::RigidTy::Bool) => true,
+            _ => false,
+        }
+    }
+
+    fn is_numeric_or_bool(ty: &smir::ty::Ty) -> bool {
+        is_numeric(ty) || is_bool(ty)
     }
 
     local_decls.iter().map(|decl| decl.ty).all(|ty| {
         is_numeric_or_bool(&ty)
-            || (is_tuple(&ty) && ty.tuple_fields().iter().all(|tyf| is_numeric_or_bool(&tyf)))
+            || (is_tuple(&ty) && tuple_fields(&ty).unwrap().iter().all(|tyf| is_numeric_or_bool(&tyf)))
     })
 }
 
@@ -117,7 +117,7 @@ fn analyze_function(function: &smir::mir::Body) -> Result<AbstractFunction, Erro
     debug!("Argument types: {arg_types:?}");
     debug!("Return type: {return_type:?}");
 
-    let local_decls: Vec<&smir::mir::LocalDecl> = function.local_decls.iter().collect();
+    let local_decls: Vec<&smir::mir::LocalDecl> = function.locals().iter().collect();
     if can_interpret(&local_decls) {
         let abstract_fn = interpret_intervals(function);
         debug!("Abstract function: {abstract_fn:?}\n");
@@ -148,23 +148,23 @@ fn interpret_intervals(function: &smir::mir::Body) -> Result<AbstractFunction, E
 }
 
 fn interpret_body(body: &smir::mir::Body, arg_values: &Vec<AbstractValue>) -> Result<HashMap<smir::mir::Local, AbstractValue>, Error> {
-    let mut state = HashMap::new();
+    let mut state: HashMap<smir::mir::Local, AbstractValue> = HashMap::new();
     let mut errors = Vec::new();
 
     let (arg_types, return_type) = get_fn_types(body);
     if arg_values.len() != arg_types.len() {
         return Err(Error::with_message(
             ErrorKind::InvalidArgumentError,
-            "Must supply same number of arguments as the function takes as input when interpretting it.".to_string()
-        ))
+            "Must supply same number of arguments as the function takes as input when interpretting it.".to_string(),
+        ));
     }
 
     // Insert arguments into state map
     for (i, arg) in arg_values.iter().enumerate() {
-        state.insert(smir::mir::Local::from_usize(i+1), arg.clone());
+        state.insert(i + 1, arg.clone());
     }
 
-    for (bb, block) in body.basic_blocks.iter_enumerated() {
+    for (bb, block) in body.blocks.iter().enumerate() {
         let result = interpret_block(block, &mut state);
         match result {
             Err(e) => errors.push(e),
@@ -175,7 +175,7 @@ fn interpret_body(body: &smir::mir::Body, arg_values: &Vec<AbstractValue>) -> Re
     Ok(state)
 }
 
-fn interpret_block(block: &smir::mir::BasicBlockData, state: &mut HashMap<smir::mir::Local, AbstractValue>) -> Result<(), Error> {
+fn interpret_block(block: &smir::mir::BasicBlock, state: &mut HashMap<smir::mir::Local, AbstractValue>) -> Result<(), Error> {
     for statement in &block.statements {
         interpret_statement(statement, state)?;
     }
@@ -184,17 +184,15 @@ fn interpret_block(block: &smir::mir::BasicBlockData, state: &mut HashMap<smir::
 
 fn interpret_statement(statement: &smir::mir::Statement, state: &mut HashMap<smir::mir::Local, AbstractValue>) -> Result<(), Error> {
     match &statement.kind {
-        smir::mir::StatementKind::Assign(box (place, rvalue)) => {
-            let loc = place.local_or_deref_local().ok_or(Error::new(ErrorKind::InterpreterError))?;
+        smir::mir::StatementKind::Assign(place, rvalue) => {
             let val = interpret_rvalue(&rvalue, state)?;
-            state.insert(loc, val);
+            state.insert(place.local, val);
             Ok(())
-        },
-        smir::mir::StatementKind::Deinit(box place) => {
-            let loc = place.local_or_deref_local().ok_or(Error::new(ErrorKind::InterpreterError))?;
-            state.insert(loc, AbstractValue::Uninit);
+        }
+        smir::mir::StatementKind::Deinit(place) => {
+            state.insert(place.local, AbstractValue::Uninit);
             Ok(())
-        },
+        }
         _ => Err(Error::new(ErrorKind::NotImplementedError)),
     }
 }
@@ -203,12 +201,12 @@ fn interpret_rvalue(rvalue: &smir::mir::Rvalue, state: &mut HashMap<smir::mir::L
     match rvalue {
         smir::mir::Rvalue::Use(op) => interpret_operand(op, state),
         // TODO(klinvill): currently we assume checked operations never fail
-        smir::mir::Rvalue::BinaryOp(op, box (left, right)) => interpret_binop(op, left, right, state),
-        smir::mir::Rvalue::CheckedBinaryOp(op, box (left, right)) => {
+        smir::mir::Rvalue::BinaryOp(op, left, right) => interpret_binop(op, left, right, state),
+        smir::mir::Rvalue::CheckedBinaryOp(op, left, right) => {
             let v = interpret_binop(op, left, right, state)?;
             // Checked operations return the value and a boolean flag that checks if an operation succeeded
             Ok(AbstractValue::Tuple(vec![v, AbstractValue::Bool(booleans::AbstractBool::False)]))
-        },
+        }
         _ => Err(Error::new(ErrorKind::NotImplementedError)),
     }
 }
@@ -223,7 +221,7 @@ fn interpret_binop(binop: &smir::mir::BinOp, left: &smir::mir::Operand, right: &
                 (AbstractValue::UintInterval(l), AbstractValue::UintInterval(r)) => Ok(AbstractValue::UintInterval(l + r)),
                 _ => Err(Error::new(ErrorKind::NotImplementedError)),
             }
-        },
+        }
         smir::mir::BinOp::Eq => {
             match (left_val, right_val) {
                 (AbstractValue::Bool(l), AbstractValue::Bool(r)) => Ok(AbstractValue::Bool(l.equals(&r))),
@@ -251,53 +249,53 @@ fn interpret_operand(op: &smir::mir::Operand, state: &mut HashMap<smir::mir::Loc
             // TODO(klinvill): Clone could be expensive. Should we instead wrap the abstract value
             //  in a shared reference like Rc?
             Ok(value.clone())
-        },
-        smir::mir::Operand::Constant(c) => match c.literal {
-            smir::mir::ConstantKind::Val(v, ty) => match v {
-                rustc_middle::mir::interpret::ConstValue::Scalar(s) => match s {
-                    rustc_middle::mir::interpret::Scalar::Int(i) => {
-                        let bits = i.to_bits(i.size()).unwrap();
-                        match ty.kind() {
-                            rustc_middle::ty::TyKind::Bool => {
-                                if bits == 0 {
-                                    Ok(AbstractValue::Bool(booleans::AbstractBool::False))
-                                } else {
-                                    Ok(AbstractValue::Bool(booleans::AbstractBool::True))
-                                }
-                            }
-                            rustc_middle::ty::TyKind::Int(_) => {
-                                let num = match i.size().bytes_usize() {
-                                    1 => i128::from(bits as i8),
-                                    2 => i128::from(bits as i16),
-                                    4 => i128::from(bits as i32),
-                                    8 => i128::from(bits as i64),
-                                    16 => i128::from(bits as i128),
-                                    _ => Err(Error::new(ErrorKind::NotImplementedError))?,
-                                };
-                                Ok(AbstractValue::IntInterval(
-                                    interval::Interval::from(num)
-                                ))
-                            },
-                            rustc_middle::ty::TyKind::Uint(_) => {
-                                let num = match i.size().bytes_usize() {
-                                    1 => u128::from(bits as u8),
-                                    2 => u128::from(bits as u16),
-                                    4 => u128::from(bits as u32),
-                                    8 => u128::from(bits as u64),
-                                    16 => u128::from(bits as u128),
-                                    _ => Err(Error::new(ErrorKind::NotImplementedError))?,
-                                };
-                                Ok(AbstractValue::UintInterval(
-                                    interval::Interval::from(num)
-                                ))
-                            },
-                            _ => Err(Error::new(ErrorKind::NotImplementedError)),
-                        }
-                    },
-                    _ => Err(Error::new(ErrorKind::NotImplementedError)),
-                },
-                _ => Err(Error::new(ErrorKind::NotImplementedError)),
-            },
+        }
+        smir::mir::Operand::Constant(c) => match c.literal.ty().kind() {
+            TyKind::RigidTy(RigidTy::Bool) => Ok(AbstractValue::Bool(booleans::AbstractBool::from(&c.literal))),
+            // rustc_middle::mir::interpret::ConstValue::Scalar(s) => match s {
+            //     rustc_middle::mir::interpret::Scalar::Int(i) => {
+            //         let bits = i.to_bits(i.size()).unwrap();
+            //         match ty.kind() {
+            //             rustc_middle::ty::TyKind::Bool => {
+            //                 if bits == 0 {
+            //                     Ok(AbstractValue::Bool(booleans::AbstractBool::False))
+            //                 } else {
+            //                     Ok(AbstractValue::Bool(booleans::AbstractBool::True))
+            //                 }
+            //             }
+            //             rustc_middle::ty::TyKind::Int(_) => {
+            //                 let num = match i.size().bytes_usize() {
+            //                     1 => i128::from(bits as i8),
+            //                     2 => i128::from(bits as i16),
+            //                     4 => i128::from(bits as i32),
+            //                     8 => i128::from(bits as i64),
+            //                     16 => i128::from(bits as i128),
+            //                     _ => Err(Error::new(ErrorKind::NotImplementedError))?,
+            //                 };
+            //                 Ok(AbstractValue::IntInterval(
+            //                     interval::Interval::from(num)
+            //                 ))
+            //             },
+            //             rustc_middle::ty::TyKind::Uint(_) => {
+            //                 let num = match i.size().bytes_usize() {
+            //                     1 => u128::from(bits as u8),
+            //                     2 => u128::from(bits as u16),
+            //                     4 => u128::from(bits as u32),
+            //                     8 => u128::from(bits as u64),
+            //                     16 => u128::from(bits as u128),
+            //                     _ => Err(Error::new(ErrorKind::NotImplementedError))?,
+            //                 };
+            //                 Ok(AbstractValue::UintInterval(
+            //                     interval::Interval::from(num)
+            //                 ))
+            //             },
+            //             _ => Err(Error::new(ErrorKind::NotImplementedError)),
+            //         }
+            //     },
+            //     _ => Err(Error::new(ErrorKind::NotImplementedError)),
+            // },
+            //     _ => Err(Error::new(ErrorKind::NotImplementedError)),
+            // },
             _ => Err(Error::new(ErrorKind::NotImplementedError)),
         }
     }
@@ -305,37 +303,17 @@ fn interpret_operand(op: &smir::mir::Operand, state: &mut HashMap<smir::mir::Loc
 
 
 fn get_place_value(place: &smir::mir::Place, state: &HashMap<smir::mir::Local, AbstractValue>) -> Result<Option<AbstractValue>, Error> {
-    let loc = place.local_or_deref_local();
-    match loc {
-        Some(l) => Ok(state.get(&l).cloned()),
-        None => {
-            let base = place.local;
-            let base_elem = match state.get(&base) {
-                Some(v) => v,
-                // Can't find the local in the state
-                None => return Ok(None),
-            };
-            let mut elem = base_elem;
-            for (p_ref, proj) in place.iter_projections() {
-                elem = match follow_projection(base_elem, &proj)? {
-                    Some(v) => v,
-                    // Can't follow the projection in the value
-                    None => return Ok(None),
-                }
-            }
-            Ok(Some(elem.clone()))
-        }
-    }
+    Ok(state.get(&place.local).cloned())
 }
 
-fn follow_projection<'a, V: std::fmt::Debug, T: std::fmt::Debug>(val: &'a AbstractValue, proj: &smir::mir::ProjectionElem<V,T>) -> Result<Option<&'a AbstractValue>, Error> {
-    match proj {
-        smir::mir::ProjectionElem::Field(f, ty) => {
-            Ok(val.get(f.index()))
-        },
-        _ => Err(Error::with_message(
-            ErrorKind::NotImplementedError,
-            format!("Projection handling is not implemented for projection {:?}", proj),
-        )),
-    }
-}
+// fn follow_projection<'a, V: std::fmt::Debug, T: std::fmt::Debug>(val: &'a AbstractValue, proj: &smir::mir::ProjectionElem<V,T>) -> Result<Option<&'a AbstractValue>, Error> {
+//     match proj {
+//         smir::mir::ProjectionElem::Field(f, ty) => {
+//             Ok(val.get(f.index()))
+//         },
+//         _ => Err(Error::with_message(
+//             ErrorKind::NotImplementedError,
+//             format!("Projection handling is not implemented for projection {:?}", proj),
+//         )),
+//     }
+// }
